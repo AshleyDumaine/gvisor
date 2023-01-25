@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
@@ -263,7 +264,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			}
 		}
 		c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
-		overlayFilestoreFile, err := createOverlayFilestore(conf.GetOverlay2())
+		overlayFilestoreFile, err := createOverlayFilestore(conf)
 		if err != nil {
 			return nil, err
 		}
@@ -400,6 +401,12 @@ func (c *Container) Start(conf *config.Config) error {
 			return err
 		}
 	} else {
+		// Create an overlay filestore for the subcontainer if its overlay is
+		// backed by a host file.
+		overlayFilestoreFile, err := createOverlayFilestore(conf)
+		if err != nil {
+			return err
+		}
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		if err := runInCgroup(c.Sandbox.CgroupJSON.Cgroup, func() error {
@@ -428,7 +435,7 @@ func (c *Container) Start(conf *config.Config) error {
 				stdios = []*os.File{os.Stdin, os.Stdout, os.Stderr}
 			}
 
-			return c.Sandbox.StartSubcontainer(c.Spec, conf, c.ID, stdios, goferFiles)
+			return c.Sandbox.StartSubcontainer(c.Spec, conf, c.ID, stdios, goferFiles, overlayFilestoreFile)
 		}); err != nil {
 			return err
 		}
@@ -775,13 +782,15 @@ func (c *Container) Destroy() error {
 	return fmt.Errorf(strings.Join(errs, "\n"))
 }
 
-func createOverlayFilestore(overlay2 config.Overlay2) (*os.File, error) {
-	if overlay2.FilestoreDir == "" {
+func createOverlayFilestore(conf *config.Config) (*os.File, error) {
+	overlay2 := conf.GetOverlay2()
+	if !overlay2.IsBackedByHostFile() {
 		return nil, nil
 	}
-	fileInfo, err := os.Stat(overlay2.FilestoreDir)
+	filestoreDir := overlay2.HostFileDir()
+	fileInfo, err := os.Stat(filestoreDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stat overlay filestore directory %q: %v", overlay2.FilestoreDir, err)
+		return nil, fmt.Errorf("failed to stat overlay filestore directory %q: %v", filestoreDir, err)
 	}
 	if !fileInfo.IsDir() {
 		return nil, fmt.Errorf("overlay2 flag should specify an existing directory")
@@ -791,13 +800,16 @@ func createOverlayFilestore(overlay2 config.Overlay2) (*os.File, error) {
 	// it is not supported on all filesystems. So we simulate it by creating a
 	// named file and then immediately unlinking it while keeping an FD on it.
 	// This file will be deleted when the container exits.
-	filestoreFile, err := os.CreateTemp(overlay2.FilestoreDir, "runsc-overlay-filestore-*")
+	filestoreFile, err := os.CreateTemp(filestoreDir, "runsc-overlay-filestore-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create a temporary file inside %q: %v", overlay2.FilestoreDir, err)
+		return nil, fmt.Errorf("failed to create a temporary file inside %q: %v", filestoreDir, err)
 	}
 	if err := unix.Unlink(filestoreFile.Name()); err != nil {
 		return nil, fmt.Errorf("failed to unlink temporary file %q: %v", filestoreFile.Name(), err)
 	}
+	// Perform this work around outside the sandbox. The sandbox may already be
+	// running with seccomp filters that do not allow this.
+	pgalloc.IMAWorkAroundForMemFile(filestoreFile.Fd())
 	return filestoreFile, nil
 }
 
